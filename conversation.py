@@ -59,7 +59,7 @@ async def wake_word_detection():
             if transcription:
                 print(f"You: {NEON_GREEN}{transcription}{RESET_COLOR}")
 
-            trigger_phrases = ["ok nova", "okay nova", "ok, nova", "okay, nova", "nova."]
+            trigger_phrases = ["ok tara", "okay tara", "ok, tara", "okay, tara", "tara."]
             if any(phrase in transcription.lower() for phrase in trigger_phrases):
                 await speak_text_streamed(transcription)
                 break
