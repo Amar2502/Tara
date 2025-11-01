@@ -37,12 +37,12 @@ async def handle_conversation():
 
 
 async def wake_word_detection():
-    """Listen continuously for wake word 'Ok Nova' before starting conversation."""
+    """Listen continuously for wake word 'Ok Tara' before starting conversation."""
     p = pyaudio.PyAudio()
     stream_in = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
-    print("\n=== NOVA Voice Assistant Started ===\n")
-    print("Listening for wake word 'Ok Nova'...")
+    print("\n=== Tara Voice Assistant Started ===\n")
+    print("Listening for wake word 'Ok Tara'...")
 
     try:
         while True:

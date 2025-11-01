@@ -21,7 +21,7 @@ async def speak_text_streamed(prompt: str):
     for stop phrases in the background.
     """
     stop_event.clear()
-    print(f"Nova: {NEON_BLUE}{RESET_COLOR}", end="", flush=True)
+    print(f"Tara: {NEON_BLUE}{RESET_COLOR}", end="", flush=True)
 
     # Background listener
     listener_thread = threading.Thread(target=record_stop_phrases, args=(stop_event, stream))

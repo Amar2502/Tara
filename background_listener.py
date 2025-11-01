@@ -60,7 +60,7 @@ def record_stop_phrases(stop_event, stream):
 
                 print("Stop phrase detected:", transcription)
 
-                trigger_phrases = ["ok nova", "stop", "ok, stop", "stop nova", "quit", "break"]
+                trigger_phrases = ["ok tara", "stop", "ok, stop", "stop tara", "quit", "break"]
                 if transcription and any(phrase in transcription.lower() for phrase in trigger_phrases):
                     stop_event.set()
                     stream.stop()
