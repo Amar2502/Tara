@@ -1,17 +1,27 @@
-"""Assistant service managing conversation flow, LCEL chains, and message history."""
+"""Assistant service managing conversation flow, LangGraph tool-calling agent, and memory."""
 
-from typing import Generator
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-from langchain_core.output_parsers import StrOutputParser
+import uuid
+from typing import Generator, List
 
-from src.core.llm import get_chat_model
-from src.utils.prompts import DEFAULT_SYSTEM_PROMPT
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import MessagesState, START, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
+
 from src.config.config import configs
+from src.core.llm import get_chat_model
+from src.tools import get_all_tools
+from src.utils.prompts import DEFAULT_SYSTEM_PROMPT
 
 
 class GroqAssistant:
-    """Conversational Assistant that manages chat chains and multi-turn message history."""
+    """Conversational Assistant powered by LangGraph, ChatGroq, and standalone tools."""
 
     def __init__(
         self,
@@ -22,73 +32,96 @@ class GroqAssistant:
         self.system_prompt = system_prompt
         self.model_name = model or configs.GROQ_MODEL
         self.temperature = temperature if temperature is not None else configs.GROQ_TEMPERATURE
-        self.llm = get_chat_model(model=self.model_name, temperature=self.temperature)
-        self._history: list[BaseMessage] = []
 
-        # Construct LangChain Expression Language (LCEL) chain
-        self.prompt_template = ChatPromptTemplate.from_messages(
-            [
-                ("system", "{system_prompt}"),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", "{input}"),
-            ]
-        )
-        self.chain = self.prompt_template | self.llm | StrOutputParser()
+        # Initialize LLM and bind available tools
+        self.llm = get_chat_model(model=self.model_name, temperature=self.temperature)
+        self.tools = get_all_tools()
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+
+        # Thread / Session ID for persistent memory
+        self.thread_id = str(uuid.uuid4())
+        self.thread_config = {"configurable": {"thread_id": self.thread_id}}
+
+        # In-memory checkpointer for conversation memory
+        self.checkpointer = MemorySaver()
+
+        # Build the LangGraph tool-calling agent
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        """Construct and compile the LangGraph workflow."""
+
+        def chat_node(state: MessagesState):
+            """Process messages with the LLM and system prompt."""
+            messages = list(state["messages"])
+            # Ensure the system prompt is always injected at the start
+            if not messages or not isinstance(messages[0], SystemMessage):
+                messages = [SystemMessage(content=self.system_prompt)] + messages
+
+            response = self.llm_with_tools.invoke(messages)
+            return {"messages": [response]}
+
+        tool_node = ToolNode(self.tools)
+
+        workflow = StateGraph(MessagesState)
+        workflow.add_node("chat_node", chat_node)
+        workflow.add_node("tools", tool_node)
+
+        workflow.add_edge(START, "chat_node")
+        workflow.add_conditional_edges("chat_node", tools_condition)
+        workflow.add_edge("tools", "chat_node")
+
+        return workflow.compile(checkpointer=self.checkpointer)
 
     @property
-    def history(self) -> list[BaseMessage]:
-        """Return a copy of the current conversation history."""
-        return list(self._history)
+    def history(self) -> List[BaseMessage]:
+        """Return the current conversation message history."""
+        try:
+            state = self.graph.get_state(self.thread_config)
+            return list(state.values.get("messages", []))
+        except Exception:
+            return []
 
     @property
     def message_count(self) -> int:
         """Return total number of messages in the current conversation."""
-        return len(self._history)
+        return len(self.history)
 
     def ask(self, user_input: str) -> str:
-        """Send a message and return the full assistant response synchronously.
-
-        Args:
-            user_input: The message from the user.
-
-        Returns:
-            str: Full response from the assistant.
-        """
-        response: str = self.chain.invoke(
-            {
-                "system_prompt": self.system_prompt,
-                "history": self._history,
-                "input": user_input,
-            }
+        """Send a message and return the assistant response synchronously."""
+        final_state = self.graph.invoke(
+            {"messages": [HumanMessage(content=user_input)]},
+            config=self.thread_config,
         )
-        self._history.append(HumanMessage(content=user_input))
-        self._history.append(AIMessage(content=response))
-        return response
+        messages = final_state.get("messages", [])
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                return str(msg.content)
+        return ""
 
     def stream_chat(self, user_input: str) -> Generator[str, None, None]:
         """Stream the assistant response token-by-token in real-time.
 
-        Args:
-            user_input: The message from the user.
-
         Yields:
-            str: Individual streamed tokens/chunks.
+            str: Streamed token chunks and tool status notifications.
         """
-        full_response = ""
-        for chunk in self.chain.stream(
-            {
-                "system_prompt": self.system_prompt,
-                "history": self._history,
-                "input": user_input,
-            }
+        for chunk, metadata in self.graph.stream(
+            {"messages": [HumanMessage(content=user_input)]},
+            config=self.thread_config,
+            stream_mode="messages",
         ):
-            full_response += chunk
-            yield chunk
+            # If a tool just completed, notify the user
+            if isinstance(chunk, ToolMessage):
+                tool_name = getattr(chunk, "name", "tool")
+                yield f"\n\n> *Tool `{tool_name}` finished processing.* \n\n"
 
-        # Persist conversation turn to history upon stream completion
-        self._history.append(HumanMessage(content=user_input))
-        self._history.append(AIMessage(content=full_response))
+            # Yield conversational content from the LLM node
+            elif metadata.get("langgraph_node") == "chat_node":
+                content = getattr(chunk, "content", "")
+                if content and isinstance(content, str):
+                    yield content
 
     def clear_history(self) -> None:
-        """Reset the conversation memory."""
-        self._history.clear()
+        """Reset conversation memory by generating a new thread session."""
+        self.thread_id = str(uuid.uuid4())
+        self.thread_config = {"configurable": {"thread_id": self.thread_id}}

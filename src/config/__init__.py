@@ -1,3 +1,4 @@
-from src.config.config import configs, configs
+from src.config.config import configs
 
-__all__ = ["configs", "configs"]
+__all__ = ["configs"]
+

@@ -16,6 +16,7 @@ class Configs:
     GROQ_MODEL: str = os.getenv("GROQ_MODEL")
     GROQ_TEMPERATURE: float = float(os.getenv("GROQ_TEMPERATURE"))
     STREAMING: bool = os.getenv("STREAMING", "true").lower() in ("true", "1", "yes")
+    TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
 
     def validate(self) -> None:
         """Validate critical configs."""
