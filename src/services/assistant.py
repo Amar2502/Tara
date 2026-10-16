@@ -1,7 +1,9 @@
 """Assistant service managing conversation flow, LangGraph tool-calling agent, and memory."""
 
+import asyncio
+import threading
 import uuid
-from typing import Generator, List
+from typing import AsyncGenerator, Generator, List, Optional
 
 from langchain_core.messages import (
     AIMessage,
@@ -10,7 +12,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langgraph.graph import MessagesState, START, StateGraph, END
+from langgraph.graph import START, StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from src.config.config import configs
@@ -24,12 +26,16 @@ from src.core.memory import (
     summarize_messages,
     trim_tool_messages,
 )
-from src.tools import get_all_tools 
+from src.tools import get_all_tools
 from src.utils.prompts import DEFAULT_SYSTEM_PROMPT
 
 
 class GroqAssistant:
-    """Conversational Assistant powered by LangGraph, ChatGroq, and standalone tools."""
+    """Conversational Assistant powered by LangGraph, ChatGroq, and standalone tools.
+    
+    Supports both synchronous and asynchronous streaming, non-blocking background
+    title generation, live tool execution feedback, and stateful system prompts.
+    """
 
     def __init__(
         self,
@@ -60,37 +66,54 @@ class GroqAssistant:
         self.graph = self._build_graph()
 
     def _build_graph(self):
-        """Construct and compile the LangGraph workflow."""
+        """Construct and compile the LangGraph workflow with stateful system prompt and memory."""
 
         def chat_node(state: ConversationState):
-            """Prepend system prompt + summary and trim oversized tool responses before invoking LLM."""
+            """Prepend active system prompt + summary and trim oversized tool responses before invoking LLM."""
             # Trim any oversized tool responses (no summarization)
             messages = trim_tool_messages(list(state["messages"]), max_chars=configs.MAX_TOOL_CHARS)
             summary = state.get("summary", "")
+
+            # Retrieve persisted system prompt from state or fall back to instance default
+            active_system_prompt = state.get("system_prompt") or self.system_prompt
+
             # Compose system prompt with running summary if available
-            system_content = self.system_prompt
+            system_content = active_system_prompt
             if summary:
                 system_content += f"\n\n[Summary of earlier conversation]:\n{summary}"
-            # Ensure system prompt is first
-            if not messages or not isinstance(messages[0], SystemMessage):
-                messages = [SystemMessage(content=system_content)] + messages
-            response = self.llm_with_tools.invoke(messages)
-            return {"messages": [response]}
-        
+
+            # Filter out any pre-existing SystemMessage to prevent duplicates in prompt
+            prompt_messages = [SystemMessage(content=system_content)]
+            for m in messages:
+                if not isinstance(m, SystemMessage):
+                    prompt_messages.append(m)
+
+            # Ensure at least one HumanMessage exists to satisfy Groq/Jinja chat template requirements
+            if not any(isinstance(m, HumanMessage) for m in prompt_messages):
+                prompt_messages.insert(1, HumanMessage(content="Please assist based on the conversation context."))
+
+            response = self.llm_with_tools.invoke(prompt_messages)
+
+            # Persist system prompt and message response into state checkpoint
+            node_output = {"messages": [response]}
+            if not state.get("system_prompt"):
+                node_output["system_prompt"] = active_system_prompt
+            return node_output
+
         def summarize_node(state: ConversationState):
             """Summarize old messages if message count exceeds threshold."""
             return summarize_messages(
                 messages=state["messages"],
                 existing_summary=state.get("summary", ""),
                 llm=self.llm,
-                max_recent_messages=6,  # keep the 6 most recent messages
+                max_recent_messages=8,  # retain the 8 most recent messages
             )
 
         def route_after_chat(state: ConversationState):
             """Route to tools if requested, or summarize if threshold reached, else END."""
             if tools_condition(state) == "tools":
                 return "tools"
-            if len(state.get("messages", [])) > 6:
+            if len(state.get("messages", [])) > 14:
                 return "summarize_node"
             return END
 
@@ -148,8 +171,39 @@ class GroqAssistant:
         """Return total number of messages in the current conversation."""
         return len(self.history)
 
-    def _auto_generate_title(self, first_message: str) -> None:
-        """Generate a concise title from the first message and store it."""
+    def update_system_prompt(self, new_prompt: str) -> None:
+        """Dynamically update active system prompt and persist it in the current session checkpoint."""
+        self.system_prompt = new_prompt
+        if self.thread_id and self.thread_config:
+            try:
+                self.graph.update_state(self.thread_config, {"system_prompt": new_prompt})
+            except Exception:
+                pass
+
+    def _spawn_title_generation(self, thread_id: str, first_message: str) -> None:
+        """Generate title in a background daemon thread without blocking first-token streaming."""
+        def _worker():
+            try:
+                messages = [
+                    SystemMessage(
+                        content="You are a title generator. Respond ONLY with a concise 3 to 5 word topic title summarizing the user message. Do not include quotes, markdown, or punctuation."
+                    ),
+                    HumanMessage(
+                        content=f"Generate a title for a chat that begins with: {first_message}"
+                    ),
+                ]
+                resp = self.llm.invoke(messages)
+                title = str(resp.content).strip().strip('"\'*#')
+                if title and len(title) <= 60:
+                    save_thread_name(thread_id, title)
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+    async def _aauto_generate_title(self, thread_id: str, first_message: str) -> None:
+        """Asynchronously generate a concise title using LLM ainvoke."""
         try:
             messages = [
                 SystemMessage(
@@ -159,19 +213,23 @@ class GroqAssistant:
                     content=f"Generate a title for a chat that begins with: {first_message}"
                 ),
             ]
-            resp = self.llm.invoke(messages)
+            resp = await self.llm.ainvoke(messages)
             title = str(resp.content).strip().strip('"\'*#')
-            if not title or len(title) > 60:
-                title = " ".join(first_message.split()[:5])
-            save_thread_name(self.thread_id, title)
+            if title and len(title) <= 60:
+                save_thread_name(thread_id, title)
         except Exception:
-            # Fallback to first few words of the user's prompt
-            fallback_title = " ".join(first_message.split()[:5]) or "Conversation"
-            save_thread_name(self.thread_id, fallback_title)
+            pass
+
+    async def _aspawn_title_generation(self, thread_id: str, first_message: str) -> None:
+        """Schedule asynchronous title generation on the active asyncio event loop."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._aauto_generate_title(thread_id, first_message))
+        except RuntimeError:
+            self._spawn_title_generation(thread_id, first_message)
 
     def stream_chat(self, user_input: str) -> Generator[str, None, None]:
-        """Stream response and lazily start/name new chat on first prompt."""
-        # Start new thread on-demand if system is in standby
+        """Stream response synchronously with live tool progress notifications and instant first-token delivery."""
         is_first_message = False
         if not self.thread_id:
             self.thread_id = str(uuid.uuid4())
@@ -180,22 +238,107 @@ class GroqAssistant:
         elif not self.history or len(self.history) == 0:
             is_first_message = True
 
-        # Auto-title on the first message
+        # Non-blocking auto-title: Save fast provisional title and refine in background
         if is_first_message:
-            self._auto_generate_title(user_input)
+            provisional_title = " ".join(user_input.split()[:5]) or "New Session"
+            save_thread_name(self.thread_id, provisional_title)
+            self._spawn_title_generation(self.thread_id, user_input)
+
+        notified_tool_calls: set = set()
 
         for chunk, metadata in self.graph.stream(
             {"messages": [HumanMessage(content=user_input)]},
             config=self.thread_config,
             stream_mode="messages",
         ):
+            # 1. Immediate feedback when tool execution is requested by LLM
+            for tc in getattr(chunk, "tool_call_chunks", []):
+                call_id = tc.get("id") or tc.get("index", 0)
+                name = tc.get("name")
+                if name and call_id not in notified_tool_calls:
+                    notified_tool_calls.add(call_id)
+                    yield f"\n\n> ⚙️ *Executing tool `{name}`...*\n\n"
+
+            for tc in getattr(chunk, "tool_calls", []):
+                call_id = tc.get("id") or tc.get("name")
+                name = tc.get("name")
+                if name and call_id not in notified_tool_calls:
+                    notified_tool_calls.add(call_id)
+                    yield f"\n\n> ⚙️ *Executing tool `{name}`...*\n\n"
+
+            # 2. Feedback when tool finishes processing
             if isinstance(chunk, ToolMessage):
                 tool_name = getattr(chunk, "name", "tool")
-                yield f"\n\n> *Tool `{tool_name}` finished processing.* \n\n"
+                yield f"> ✔️ *Tool `{tool_name}` finished processing.* \n\n"
+
+            # 3. Stream generated response tokens
             elif metadata.get("langgraph_node") == "chat_node":
                 content = getattr(chunk, "content", "")
                 if content and isinstance(content, str):
                     yield content
+
+    async def astream_chat(self, user_input: str) -> AsyncGenerator[str, None]:
+        """Stream response asynchronously with live tool progress notifications and instant first-token delivery."""
+        is_first_message = False
+        if not self.thread_id:
+            self.thread_id = str(uuid.uuid4())
+            self.thread_config = {"configurable": {"thread_id": self.thread_id}}
+            is_first_message = True
+        elif not self.history or len(self.history) == 0:
+            is_first_message = True
+
+        # Non-blocking auto-title: Save fast provisional title and refine concurrently
+        if is_first_message:
+            provisional_title = " ".join(user_input.split()[:5]) or "New Session"
+            save_thread_name(self.thread_id, provisional_title)
+            await self._aspawn_title_generation(self.thread_id, user_input)
+
+        notified_tool_calls: set = set()
+
+        async for chunk, metadata in self.graph.astream(
+            {"messages": [HumanMessage(content=user_input)]},
+            config=self.thread_config,
+            stream_mode="messages",
+        ):
+            # 1. Immediate feedback when tool execution is requested by LLM
+            for tc in getattr(chunk, "tool_call_chunks", []):
+                call_id = tc.get("id") or tc.get("index", 0)
+                name = tc.get("name")
+                if name and call_id not in notified_tool_calls:
+                    notified_tool_calls.add(call_id)
+                    yield f"\n\n> ⚙️ *Executing tool `{name}`...*\n\n"
+
+            for tc in getattr(chunk, "tool_calls", []):
+                call_id = tc.get("id") or tc.get("name")
+                name = tc.get("name")
+                if name and call_id not in notified_tool_calls:
+                    notified_tool_calls.add(call_id)
+                    yield f"\n\n> ⚙️ *Executing tool `{name}`...*\n\n"
+
+            # 2. Feedback when tool finishes processing
+            if isinstance(chunk, ToolMessage):
+                tool_name = getattr(chunk, "name", "tool")
+                yield f"> ✔️ *Tool `{tool_name}` finished processing.* \n\n"
+
+            # 3. Stream generated response tokens
+            elif metadata.get("langgraph_node") == "chat_node":
+                content = getattr(chunk, "content", "")
+                if content and isinstance(content, str):
+                    yield content
+
+    def invoke(self, user_input: str) -> str:
+        """Synchronously execute a full conversation turn and return the final string response."""
+        full_response = []
+        for chunk in self.stream_chat(user_input):
+            full_response.append(chunk)
+        return "".join(full_response)
+
+    async def ainvoke(self, user_input: str) -> str:
+        """Asynchronously execute a full conversation turn and return the final string response."""
+        full_response = []
+        async for chunk in self.astream_chat(user_input):
+            full_response.append(chunk)
+        return "".join(full_response)
 
     def clear_history(self) -> None:
         """Reset conversation session to standby (new chat will begin on next message)."""

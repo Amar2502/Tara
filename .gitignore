@@ -3,3 +3,11 @@ __pycache__/
 *.pyc   
 .env
 .vscode/
+
+chatbot.db
+chatbot.db-shm
+chatbot.db-wal
+future.md
+reference.wav
+
+test.py
